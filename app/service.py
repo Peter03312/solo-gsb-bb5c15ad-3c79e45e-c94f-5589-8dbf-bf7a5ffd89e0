@@ -1414,7 +1414,9 @@ class AuditService:
         - 只在两车均有轨迹覆盖且同时位于区内时比较同一时刻的平面距离
           （沿用相邻点线性插值、区域生效窗口与带洞边界规则）；
         - 按无序车次对返回距离严格小于阈值的正时长区间（起止、持续秒数、区间最小距离），
-          相接且连续满足条件的区间合并，瞬时触及忽略；合法但无相遇返回空列表。
+          仅当相接点本身仍严格满足条件（距离严格小于阈值、两车轨迹均覆盖、同时位于生效
+          危险区）时才合并跨接点的两段；阈值相等的瞬时接点分成两段；正时长空档切断，
+          瞬时触及忽略；合法但无相遇返回空列表。
         """
         if not isinstance(zone_id, str) or not zone_id.strip():
             raise ValidationError("zone_id 必须是非空字符串")
@@ -1509,7 +1511,12 @@ class AuditService:
                 # 两车覆盖区间的半开交集：双方均有轨迹覆盖且同时位于区内的时间
                 common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
                 intervals = self._encounter_intervals(
-                    points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                    points_by_trip[tid_a],
+                    points_by_trip[tid_b],
+                    common,
+                    max_distance,
+                    coverage[tid_a],
+                    coverage[tid_b],
                 )
                 if not intervals:
                     continue
@@ -1553,13 +1560,22 @@ class AuditService:
         points_b: List[Any],
         common: List[Tuple[float, float]],
         max_distance: float,
+        coverage_a: Optional[List[Tuple[float, float]]] = None,
+        coverage_b: Optional[List[Tuple[float, float]]] = None,
     ) -> List[Tuple[float, float, float]]:
         """两车公共在区时间内、平面距离严格小于阈值的正时长区间（含区间最小距离）。
 
         把公共区间按两车轨迹点时刻切成原子段：每段内两车各自线性运动，
         相对位置随时间线性变化，距离平方为开口向上抛物线，解析求严格小于
-        阈值的子区间；相接（端点重合）且连续满足条件的区间合并，最小距离
-        取各段最小；零时长触及不产生区间。
+        阈值的子区间；零时长触及不产生区间。
+
+        两段正时长相遇仅在某一轨迹采样时刻（切点）相接时，**只有接点本身仍
+        严格满足全部条件**才合并：接点处距离严格小于阈值，且两车轨迹均覆盖、
+        同时位于生效危险区（接点落在某一公共在区区间内）。接点距离恰等于阈值
+        时（该点为相对运动折点处的局部高点，前后均严格小于阈值），两段必须
+        分开返回；任一车轨迹未覆盖或驶出生效窗口/穿洞的接点同样不得合并。
+        正时长空档（哪怕仅 1 微秒）一律切断：空档内可能有车驶出生效窗口/穿洞，
+        不得把两段相遇连成一段。
         """
         ts_a = [r["ts_epoch"] for r in points_a]
         ts_b = [r["ts_epoch"] for r in points_b]
@@ -1579,14 +1595,37 @@ class AuditService:
                 )
                 if piece is not None:
                     candidates.append(piece)
-        # 仅在重叠或端点恰好相接（前一段终点 == 后一段起点，且两段都满足条件，
-        # 即“条件连续”）时合并；正时长空档必须切断——即使仅相隔 1 微秒，
-        # 空档内可能有车驶出生效窗口/穿洞，不得把两段相遇连成一段
+
+        def _joint_eligible(t: float) -> bool:
+            """相接点 t 是否允许跨接合并：距离严格小于阈值且两车在 t 均有
+            “轨迹覆盖且位于生效危险区”（t 落入双方覆盖的半开公共在区时间）。"""
+            # 距离严格小于阈值（比较平方，避免开方误差使恰等阈值被误判为严格小于）
+            ax, ay = self._position_at(points_a, ts_a, t)
+            bx, by = self._position_at(points_b, ts_b, t)
+            dx, dy = ax - bx, ay - by
+            if dx * dx + dy * dy >= max_distance * max_distance:
+                return False
+            # 两车轨迹覆盖且同时位于生效危险区：t 属于某一公共在区半开区间
+            if not any(s <= t < e for s, e in common):
+                return False
+            # 显式复核双方各自的覆盖区间（防御性：公共交集由二者裁剪而来，
+            # 正常情况下上一条已蕴含；保留独立判定以明确“两车轨迹均覆盖”的语义）
+            if coverage_a is not None and not any(s <= t < e for s, e in coverage_a):
+                return False
+            if coverage_b is not None and not any(s <= t < e for s, e in coverage_b):
+                return False
+            return True
+
+        # 重叠（浮点同一切点上的解析结果）照常合并；仅端点恰好相接（前段终点
+        # 恰为后段起点）时，还要求接点本身严格满足条件才合并——否则切成两段。
         merged: List[List[float]] = []
         for s, e, min_d in candidates:
             if merged and s <= merged[-1][1]:
-                merged[-1][1] = max(merged[-1][1], e)
-                merged[-1][2] = min(merged[-1][2], min_d)
+                if s == merged[-1][1] and not _joint_eligible(s):
+                    merged.append([s, e, min_d])
+                else:
+                    merged[-1][1] = max(merged[-1][1], e)
+                    merged[-1][2] = min(merged[-1][2], min_d)
             else:
                 merged.append([s, e, min_d])
         return [(s, e, md) for s, e, md in merged if e - s > self.min_duration]
@@ -1778,11 +1817,18 @@ class AuditService:
             for j in range(i + 1, len(trip_ids)):
                 tid_a, tid_b = trip_ids[i], trip_ids[j]
                 common = clip_intervals_halfopen(coverage[tid_a], coverage[tid_b])
-                # _encounter_intervals 已保证正时长且按起点升序合并
+                # _encounter_intervals 已保证正时长且按起点升序合并；接点距离恰等
+                # 阈值（或接点处任一车未覆盖/不在生效区）时切成两段，传播沿用
+                # 修正后的相遇段，瞬时接点本身不产生可传递窗口
                 intervals = [
                     (s, e)
                     for s, e, _min_d in self._encounter_intervals(
-                        points_by_trip[tid_a], points_by_trip[tid_b], common, max_distance
+                        points_by_trip[tid_a],
+                        points_by_trip[tid_b],
+                        common,
+                        max_distance,
+                        coverage[tid_a],
+                        coverage[tid_b],
                     )
                 ]
                 if intervals:

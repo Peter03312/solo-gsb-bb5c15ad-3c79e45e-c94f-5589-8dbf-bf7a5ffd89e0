@@ -168,6 +168,65 @@ def test_merge_across_point_timestamp(client):
     assert segs[0]["min_distance"] == 20.0
 
 
+def test_threshold_equal_at_sample_joint_splits_segments(client):
+    """两段正时长相遇仅于轨迹采样时刻相接、接点距离恰等于阈值（前后均严格小于）：
+    不得跨接点合并，返回两段，各自保留起止、时长与最小距离。"""
+    register_square(client, zone_id="px-eq")
+    # T1 沿 y=40 以 1m/s，t=50 处有采样点
+    _upload(client, "T1", [
+        ("a", "2026-09-30T10:00:00Z", 0, 40),
+        ("m", "2026-09-30T10:00:50Z", 50, 40),
+        ("b", "2026-09-30T10:01:40Z", 100, 40),
+    ])
+    # T2：接点 t=50 处相距恰 25m，两侧各线性拉开到 24m（局部高点折点）
+    _upload(client, "T2", [
+        ("a", "2026-09-30T10:00:00Z", 0, 64),
+        ("m", "2026-09-30T10:00:50Z", 50, 65),
+        ("b", "2026-09-30T10:01:40Z", 100, 64),
+    ])
+    r = _ask(client, "px-eq", max_distance=25)
+    assert r.status_code == 200, r.text
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        ("2026-09-30T10:00:00Z", "2026-09-30T10:00:50Z", 50.0, 24.0),
+        ("2026-09-30T10:00:50Z", "2026-09-30T10:01:40Z", 50.0, 24.0),
+    ]
+    # 阈值严格大于接点距离：接点仍满足条件，相接段照常合并为一段
+    r = _ask(client, "px-eq", max_distance=25.000001)
+    segs = r.json()["pairs"][0]["intervals"]
+    assert len(segs) == 1
+    assert segs[0]["start"] == "2026-09-30T10:00:00Z"
+    assert segs[0]["end"] == "2026-09-30T10:01:40Z"
+    assert segs[0]["duration_sec"] == 100.0
+    assert segs[0]["min_distance"] == 24.0
+
+
+def test_threshold_equal_joint_with_trailing_gap(client):
+    """接点距离等于阈值，且第二段之后还有正时长空档再接第三段：接点切断与空档切断并存。"""
+    register_square(client, zone_id="px-eq2")
+    # T1 沿 y=40 以 1m/s；t=50、t=80 各有采样点
+    _upload(client, "T1", [
+        ("a", "2026-09-30T10:00:00Z", 0, 40),
+        ("m", "2026-09-30T10:00:50Z", 50, 40),
+        ("n", "2026-09-30T10:01:20Z", 80, 40),
+        ("b", "2026-09-30T10:01:40Z", 100, 40),
+    ])
+    # T2：[0,50] 距离 24→25（接点等阈值）；(50,80) 驶开到 90m（空档）；
+    # [80,100] 自 90m 线性回到 24m，仅在尾段约 0.3s 重新进入阈值
+    _upload(client, "T2", [
+        ("a", "2026-09-30T10:00:00Z", 0, 64),
+        ("m", "2026-09-30T10:00:50Z", 50, 65),
+        ("n", "2026-09-30T10:01:20Z", 80, 130),
+        ("b", "2026-09-30T10:01:40Z", 100, 64),
+    ])
+    r = _ask(client, "px-eq2", max_distance=25)
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"]) for s in segs] == [
+        ("2026-09-30T10:00:00Z", "2026-09-30T10:00:50Z", 50.0),
+        ("2026-09-30T10:01:39.696970Z", "2026-09-30T10:01:40Z", 0.30303),
+    ]
+
+
 def test_separate_intervals_not_merged(client):
     """距离先低于阈值、再高于、再低于：得到两个不相接区间，各自给出最小距离。"""
     register_square(client, zone_id="px6")
@@ -184,6 +243,28 @@ def test_separate_intervals_not_merged(client):
         ("2026-09-30T10:00:00Z", "2026-09-30T10:00:22.222222Z", 22.222222, 5.0),
         ("2026-09-30T10:01:17.777778Z", "2026-09-30T10:01:40Z", 22.222222, 5.0),
     ]
+
+
+def test_coverage_gap_between_windows_keeps_segments_split(client):
+    """两个仅端点相接的相遇候选：中间隔着正时长的生效窗口空档（车辆轨迹仍连续、
+    持续相遇），空档必须切断，返回两段而非合并。"""
+    register_square(
+        client, zone_id="px-gap",
+        windows=[
+            {"start": "2026-09-30T10:00:00Z", "end": "2026-09-30T10:00:30Z"},
+            {"start": "2026-09-30T10:00:31Z", "end": "2026-09-30T10:02:00Z"},
+        ],
+    )
+    # 恒定相距 20m，阈值 25：若无窗口空档本应合并为一整段
+    _upload(client, "T1", TRACK_X40)
+    _upload(client, "T2", TRACK_PAR20)
+    r = _ask(client, "px-gap", max_distance=25)
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"]) for s in segs] == [
+        ("2026-09-30T10:00:00Z", "2026-09-30T10:00:30Z", 30.0),
+        ("2026-09-30T10:00:31Z", "2026-09-30T10:01:40Z", 69.0),
+    ]
+    assert all(s["min_distance"] == 20.0 for s in segs)
 
 
 def test_no_encounter_returns_empty_list(client):

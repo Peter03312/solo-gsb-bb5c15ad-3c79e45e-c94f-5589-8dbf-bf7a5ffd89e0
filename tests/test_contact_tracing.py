@@ -440,6 +440,50 @@ def test_strict_threshold_not_transmissible(client):
     assert results["A"]["arrived_at"] == "2026-09-30T10:00:00Z"
 
 
+def test_threshold_equal_sample_joint_segments_remain_transmissible(client):
+    """S-A 的相遇在轨迹采样接点 t=50 处距离恰等于阈值（前后均严格小于）：相遇段
+    被分成两段，传播沿用修正后的段——前段终点就是接点，恰在接点到达不能经前段
+    传递，但可自后段起点 t=50 继续；正时长到达仍取最早时刻。"""
+    register_square(client, zone_id="ct-eq")
+    # S 沿 y=50 以 1m/s，t=50 有采样点
+    _upload(client, "S", [
+        ("s1", "2026-09-30T10:00:00Z", 0, 50),
+        ("sm", "2026-09-30T10:00:50Z", 50, 50),
+        ("s2", "2026-09-30T10:01:40Z", 100, 50),
+    ])
+    # A：接点 t=50 处相距恰 25m，两侧各线性拉开到 24m
+    _upload(client, "A", [
+        ("a1", "2026-09-30T10:00:00Z", 0, 74),
+        ("am", "2026-09-30T10:00:50Z", 50, 75),
+        ("a2", "2026-09-30T10:01:40Z", 100, 74),
+    ])
+    # B 静止 (100,75)：与 S 纵向相距 25m 从不严格相遇；与 A 仅在第二相遇段内
+    # （接点 t=50 之后）约 t∈(75,100] 相遇，必须由后段传递
+    _upload(client, "B", [
+        ("b1", "2026-09-30T09:55:00Z", 100, 75),
+        ("b2", "2026-09-30T10:10:00Z", 100, 75),
+    ])
+    r = _ask(client, "ct-eq")
+    assert r.status_code == 200, r.text
+    results = _result_map(r.json())
+    # A：两段分别 [0,50) 与 [50,100)，源车 t=0 已到达 → 0 时刻直达
+    assert results["A"]["reachable"] is True
+    assert results["A"]["arrived_at"] == "2026-09-30T10:00:00Z"
+    assert results["A"]["hops"] == 1
+    # B：与 S 从不相遇，只能经 S→A→B；接点前段内 A-B 不相遇，于后段相遇起点到达
+    assert results["B"]["reachable"] is True
+    assert results["B"]["arrived_at"] == "2026-09-30T10:01:15.005002Z"
+    assert results["B"]["hops"] == 2
+    assert results["B"]["chain"] == ["S", "A", "B"]
+    # 源车若恰在接点 t=50 到达：前段 [0,50) 已结束（恰在终点不算），只能经后段
+    # [50,100) 于接点 t=50 传递给 A
+    r = _ask(client, "ct-eq", since="2026-09-30T10:00:50Z")
+    results = _result_map(r.json())
+    assert results["A"]["reachable"] is True
+    assert results["A"]["arrived_at"] == "2026-09-30T10:00:50Z"
+    assert results["A"]["hops"] == 1
+
+
 def test_hole_rule_reused(client):
     """带洞边界沿用相遇复核：穿洞期间不构成共同在区，相遇被洞切成两段但仍可在起点传递。"""
     hole = [[[40, 40], [60, 40], [60, 60], [40, 60]]]
