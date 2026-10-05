@@ -1558,13 +1558,20 @@ class AuditService:
 
         把公共区间按两车轨迹点时刻切成原子段：每段内两车各自线性运动，
         相对位置随时间线性变化，距离平方为开口向上抛物线，解析求严格小于
-        阈值的子区间；相接（端点重合）且连续满足条件的区间合并，最小距离
-        取各段最小；零时长触及不产生区间。
+        阈值的子区间；零时长触及不产生区间。
+
+        合并仅在下列全部条件成立时进行（公共区间已经过半开求交，覆盖了两车轨迹
+        覆盖空档与区域生效空档：分属不同公共区间的两段不会合并）：
+        - 前段终点恰等于后段起点（正长度重叠照常合并；正时长空档 `s > 前 e` 切断）；
+        - 接点属于同一段公共在区时间（两车轨迹均覆盖且同时位于生效危险区内）；
+        - 接点本身的两车距离**严格小于**阈值：接点距离恰等于阈值意味着严格条件
+          在该瞬不成立，两段必须分开并各自保留起止、时长与最小距离。
         """
         ts_a = [r["ts_epoch"] for r in points_a]
         ts_b = [r["ts_epoch"] for r in points_b]
-        candidates: List[Tuple[float, float, float]] = []
-        for s, e in common:
+        # 候选附所属公共区间序号：只有同序号的相接段才允许合并
+        candidates: List[Tuple[int, float, float, float]] = []
+        for cidx, (s, e) in enumerate(common):
             cuts = {s, e}
             for t in ts_a:
                 if s < t < e:
@@ -1578,18 +1585,41 @@ class AuditService:
                     points_a, ts_a, points_b, ts_b, a, b, max_distance
                 )
                 if piece is not None:
-                    candidates.append(piece)
-        # 仅在重叠或端点恰好相接（前一段终点 == 后一段起点，且两段都满足条件，
-        # 即“条件连续”）时合并；正时长空档必须切断——即使仅相隔 1 微秒，
-        # 空档内可能有车驶出生效窗口/穿洞，不得把两段相遇连成一段
+                    candidates.append((cidx, piece[0], piece[1], piece[2]))
+
+        d2 = max_distance * max_distance
+
+        def _strictly_inside_at(t: float) -> bool:
+            """接点在同一段公共在区时间内即保证两车轨迹覆盖且位于生效区内，
+            只需再判距离严格小于阈值（平方比较，恰等于不合并）。"""
+            ax, ay = self._position_at(points_a, ts_a, t)
+            bx, by = self._position_at(points_b, ts_b, t)
+            dx, dy = ax - bx, ay - by
+            return dx * dx + dy * dy < d2
+
         merged: List[List[float]] = []
-        for s, e, min_d in candidates:
-            if merged and s <= merged[-1][1]:
+        for cidx, s, e, min_d in candidates:
+            if (
+                merged
+                and cidx == merged[-1][3]
+                and s == merged[-1][1]
+                and _strictly_inside_at(s)
+            ):
+                # 端点恰好相接、接点仍严格满足距离条件且位于同一段公共在区时间：
+                # 条件连续，合并为一段，最小距离取两段最小
+                merged[-1][1] = max(merged[-1][1], e)
+                merged[-1][2] = min(merged[-1][2], min_d)
+            elif merged and cidx == merged[-1][3] and s < merged[-1][1]:
+                # 防御性分支：同原子段内切出的子段若正长度重叠则并入
                 merged[-1][1] = max(merged[-1][1], e)
                 merged[-1][2] = min(merged[-1][2], min_d)
             else:
-                merged.append([s, e, min_d])
-        return [(s, e, md) for s, e, md in merged if e - s > self.min_duration]
+                # 正时长空档、分属不同公共区间（覆盖/生效空档）或接点距离恰等于
+                # 阈值：保持两段分离
+                merged.append([s, e, min_d, cidx])
+        # 正时长空档必须切断——即使仅相隔 1 微秒，空档内可能有车驶出生效窗口/穿洞，
+        # 不得把两段相遇连成一段；阈值相等的瞬时接点同样分成两段
+        return [(s, e, md) for s, e, md, _c in merged if e - s > self.min_duration]
 
     def _close_interval_on_piece(
         self,
@@ -1626,8 +1656,10 @@ class AuditService:
         lo_u, hi_u = max(u1, 0.0), min(u2, 1.0)
         if hi_u <= lo_u:
             return None
-        s = a + lo_u * (b - a)
-        e = a + hi_u * (b - a)
+        # 根恰在原子段端点（轨迹采样时刻/公共区间边界）时直接取切割点时刻：
+        # 保证相邻原子段两端在浮点上精确相等，相接判定无需任何时间容差
+        s = a if lo_u == 0.0 else a + lo_u * (b - a)
+        e = b if hi_u == 1.0 else a + hi_u * (b - a)
         if e - s <= self.min_duration:
             return None
 

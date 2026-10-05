@@ -440,6 +440,27 @@ def test_strict_threshold_not_transmissible(client):
     assert results["A"]["arrived_at"] == "2026-09-30T10:00:00Z"
 
 
+def test_contact_tracing_reuses_corrected_encounter_segments(client):
+    """建边直接调用近距离相遇的同一 `_encounter_intervals`：阈值相等接点把相遇
+    切成两段后，可传递边也必须是 [0,50)、[50,100) 两段——接点这一瞬不可传递，
+    紧接其后的正时长第二段仍按段起点接续，不得把两段桥成 [0,100)。"""
+    from app.main import service
+
+    def rows(pts):
+        return [{"ts_epoch": t, "x": x, "y": y} for t, x, y in pts]
+
+    # A 静止 (50,40)；B：(50,60)→(50,65)→(50,20)，t=50 处与 A 恰相距 25
+    a = rows([(0.0, 50, 40), (100.0, 50, 40)])
+    b = rows([(0.0, 50, 60), (50.0, 50, 65), (100.0, 50, 20)])
+    intervals = service._encounter_intervals(a, b, [(0.0, 100.0)], 25.0)
+    assert [(round(s, 6), round(e, 6)) for s, e, _d in intervals] == [(0.0, 50.0), (50.0, 100.0)]
+    # 各段最小距离分别保留（第一段 20m，第二段最近为相撞 0）
+    assert [round(md, 6) for _s, _e, md in intervals] == [20.0, 0.0]
+    # 阈值放宽覆盖接点即重新合并为单段：持续严格满足条件的相接段仍合并
+    intervals = service._encounter_intervals(a, b, [(0.0, 100.0)], 25.000001)
+    assert [(round(s, 6), round(e, 6)) for s, e, _d in intervals] == [(0.0, 100.0)]
+
+
 def test_hole_rule_reused(client):
     """带洞边界沿用相遇复核：穿洞期间不构成共同在区，相遇被洞切成两段但仍可在起点传递。"""
     hole = [[[40, 40], [60, 40], [60, 60], [40, 60]]]

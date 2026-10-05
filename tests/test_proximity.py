@@ -168,6 +168,38 @@ def test_merge_across_point_timestamp(client):
     assert segs[0]["min_distance"] == 20.0
 
 
+def test_threshold_equal_at_sample_timestamp_splits_segments(client):
+    """两段正时长相遇仅于轨迹采样时刻相接、接点距离恰等于阈值：必须分成两段。
+
+    T1 静止 (50,40)；T2 沿 x=50 做倒 V：y 60→65→60（t=0/50/100），
+    与 T1 距离前半 20+0.1t、后半 30-0.1t：t≠50 均严格小于 25，t=50 恰为 25。
+    旧实现只凭“端点相接”合并，会错误返回跨接点的一段。
+    """
+    register_square(client, zone_id="px5b")
+    _upload(client, "T1", [
+        ("a", "2026-09-30T10:00:00Z", 50, 40),
+        ("b", "2026-09-30T10:01:40Z", 50, 40),
+    ])
+    _upload(client, "T2", [
+        ("a", "2026-09-30T10:00:00Z", 50, 60),
+        ("m", "2026-09-30T10:00:50Z", 50, 65),
+        ("c", "2026-09-30T10:01:40Z", 50, 60),
+    ])
+    r = _ask(client, "px5b")
+    assert r.status_code == 200, r.text
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        ("2026-09-30T10:00:00Z", "2026-09-30T10:00:50Z", 50.0, 20.0),
+        ("2026-09-30T10:00:50Z", "2026-09-30T10:01:40Z", 50.0, 20.0),
+    ]
+    # 阈值放宽到严格覆盖接点：两段条件连续，重新合并为一段，最小距离仍为 20
+    r = _ask(client, "px5b", max_distance=25.000001)
+    segs = r.json()["pairs"][0]["intervals"]
+    assert [(s["start"], s["end"], s["duration_sec"], s["min_distance"]) for s in segs] == [
+        ("2026-09-30T10:00:00Z", "2026-09-30T10:01:40Z", 100.0, 20.0),
+    ]
+
+
 def test_separate_intervals_not_merged(client):
     """距离先低于阈值、再高于、再低于：得到两个不相接区间，各自给出最小距离。"""
     register_square(client, zone_id="px6")
